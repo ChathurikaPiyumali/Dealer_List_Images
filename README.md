@@ -53,15 +53,28 @@ Run in headed mode (to watch Chrome work):
 - --dealers → starting URL
 - --out → folder where images are saved
 
+--------------------------------------------------------
+
+#SUMMARY
+
+python -m venv venv
+
+pip install selenium webdriver-manager requests beautifulsoup4
+
+python dealers_scrape_clickhard.py --headed --dealers https://autostream.lk/dealers-list/ --out autostream_dealers --slow-wait 75
+
+----------------------------------------------------------------
 After completion, check the folder:
   autostream_dealers/
     Dealer_A/
-      1/
-        01.jpg
-        02.jpg
-    Dealer_B/
-      1/
-      2/
+      1-vehical name
+      2-vehicle name
+     Dealer_B/
+      1-vehicle name
+      2-vehicle name
+    
+
+    
 
 
 
