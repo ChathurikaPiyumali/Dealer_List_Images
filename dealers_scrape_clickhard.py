@@ -20,6 +20,11 @@ from webdriver_manager.chrome import ChromeDriverManager
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif")
 
+GENERIC_BAD_WORDS = {
+    "summary","details","listing","inventory","vehicle","car","cars","shop","catalog","category",
+    "buy","sell","result","results","search","profile","dealer","account","author","page"
+}
+
 def log(s): print(s, flush=True)
 
 # ---------- utils ----------
@@ -35,6 +40,30 @@ def normalize_img(u: str) -> str:
 def soup_from(sess: requests.Session, url: str) -> BeautifulSoup:
     r = sess.get(url, timeout=45); r.raise_for_status()
     return BeautifulSoup(r.text, "html.parser")
+
+def _split_title_candidates(t: str) -> list[str]:
+    # split on common separators and trim
+    parts = re.split(r"\s+[\-\–\—\:\|\·]\s+", t)
+    parts = [p.strip() for p in parts if p and len(p.strip()) >= 2]
+    return parts if parts else [t.strip()]
+
+def _score_title(t: str) -> int:
+    # prefer titles with year/make/model tokens, avoid generic words
+    tl = t.lower()
+    tokens = re.findall(r"[a-z0-9]+", tl)
+    bad = sum(1 for x in tokens if x in GENERIC_BAD_WORDS)
+    year = 1 if re.search(r"\b(19|20)\d{2}\b", t) else 0
+    length_bonus = min(len(tokens), 8)
+    return year*5 + length_bonus - bad*2
+
+def _clean_title_piece(t: str) -> str:
+    # drop trailing site/dealer name chunks if present
+    parts = _split_title_candidates(t)
+    if len(parts) == 1:
+        return parts[0]
+    # choose the best-scoring chunk
+    best = max(parts, key=_score_title)
+    return best
 
 def extract_images(listing_url: str, soup: BeautifulSoup) -> list[str]:
     urls = set()
@@ -53,6 +82,103 @@ def extract_images(listing_url: str, soup: BeautifulSoup) -> list[str]:
             u = urljoin(listing_url, m.group(2)); u = normalize_img(u)
             if any(u.lower().endswith(ext) for ext in IMG_EXTS): urls.add(u)
     return sorted(urls)
+
+def slug_from_url(vurl: str) -> str:
+    try:
+        path = urlparse(vurl).path.rstrip("/")
+        slug = path.split("/")[-1]
+        if not slug:
+            return ""
+        # remove id tails like -1234
+        slug = re.sub(r"-\d{3,}$", "", slug)
+        slug = slug.replace("-", " ")
+        slug = re.sub(r"\s+", " ", slug).strip()
+        # Title-case but keep ALLCAPS words
+        slug_tc = " ".join(w if w.isupper() else w.capitalize() for w in slug.split())
+        return slug_tc
+    except Exception:
+        return ""
+
+def looks_generic(t: str) -> bool:
+    tl = t.lower()
+    # generic if too few letters or dominated by generic words
+    if len(re.findall(r"[a-zA-Z]", t)) < 3:
+        return True
+    toks = re.findall(r"[a-z0-9]+", tl)
+    if not toks:
+        return True
+    gen = sum(1 for x in toks if x in GENERIC_BAD_WORDS)
+    return gen >= max(1, len(toks)//2)
+
+def extract_vehicle_name(vsoup: BeautifulSoup, vurl: str) -> str:
+    cands = []
+
+    # 1) Meta candidates
+    for sel in [
+        ("meta", {"property":"og:title"}),
+        ("meta", {"name":"og:title"}),
+        ("meta", {"name":"twitter:title"}),
+        ("meta", {"itemprop":"name"}),
+        ("meta", {"name":"title"}),
+    ]:
+        m = vsoup.find(*sel)
+        if m and (m.get("content") or m.get("value")):
+            t = m.get("content") or m.get("value")
+            cands.append(t)
+
+    # 2) Headings / common theme selectors
+    for css in [
+        "h1.entry-title","h1.stm-title","h1.listing-title","h1.car-title","h1[itemprop='name']","h1",
+        "h2.entry-title","h2.stm-title","h2.car-title","h2[itemprop='name']","h2",
+        ".single-car-title",".stm-vehicle-title",".listing_title",".car_page_title",".title h1",".title h2"
+    ]:
+        el = vsoup.select_one(css)
+        if el and el.get_text(strip=True):
+            cands.append(el.get_text(strip=True))
+
+    # 3) Breadcrumb last item
+    for css in ["nav.breadcrumbs li.current","ul.breadcrumb li.active","ol.breadcrumb li.active","ol.breadcrumb li:last-child","ul.breadcrumb li:last-child"]:
+        el = vsoup.select_one(css)
+        if el and el.get_text(strip=True):
+            cands.append(el.get_text(strip=True))
+
+    # 4) JSON-LD Product/Vehicle
+    for tag in vsoup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(tag.string or "")
+            def pull_names(obj):
+                if isinstance(obj, dict):
+                    if "name" in obj and isinstance(obj["name"], str):
+                        cands.append(obj["name"])
+                    for v in obj.values():
+                        pull_names(v)
+                elif isinstance(obj, list):
+                    for it in obj: pull_names(it)
+            pull_names(data)
+        except Exception:
+            pass
+
+    # 5) Clean and score
+    cleaned = []
+    for t in cands:
+        if not t: continue
+        t = re.sub(r"\s+", " ", t).strip()
+        t = _clean_title_piece(t)
+        if t and not looks_generic(t):
+            cleaned.append(t)
+
+    # Choose best by score
+    if cleaned:
+        best = max(cleaned, key=_score_title)
+        return best
+
+    # 6) Fallback to URL slug
+    slug = slug_from_url(vurl)
+    if slug and not looks_generic(slug):
+        return slug
+
+    # 7) Final fallback
+    return "Car"
 
 # ---------- driver ----------
 def make_driver(headless: bool):
@@ -73,16 +199,13 @@ INV_TAB_XPATHS = [
 ]
 
 SHOW_MORE_CANDIDATES = [
-    # text matches
     "//button[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'show more')]",
     "//a[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'show more')]",
     "//button[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'load more')]",
     "//a[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'load more')]",
-    # rel-based
     "//a[@rel='next']",
 ]
 SHOW_MORE_CLASSES = [
-    # common class patterns on WP/Motors
     ".stm-load-more", ".load-more", ".btn-load-more",
     ".stm_ajax_load_more", ".stm-ajax-load-more", ".stm_load_more",
     ".stm-inventory-load-more", ".stm-ajax-load-more-btn",
@@ -99,7 +222,6 @@ DISMISS_JS = """
       try { el.click(); } catch(e){}
     }
   }
-  // reduce interference of sticky overlays
   const hi = Array.from(document.querySelectorAll('*')).filter(e=>{
     const s = getComputedStyle(e);
     if (!s) return false;
@@ -153,7 +275,6 @@ def try_open_inventory_tab(driver):
     return False
 
 def find_show_more(driver):
-    # XPaths first (text / rel)
     for xp in SHOW_MORE_CANDIDATES:
         try:
             els = driver.find_elements(By.XPATH, xp)
@@ -162,7 +283,6 @@ def find_show_more(driver):
                 return els[0]
         except Exception:
             pass
-    # class-based CSS
     for css in SHOW_MORE_CLASSES:
         try:
             els = driver.find_elements(By.CSS_SELECTOR, f"{css}:not([disabled])")
@@ -171,7 +291,6 @@ def find_show_more(driver):
                 return els[0]
         except Exception:
             pass
-    # last resort: any button near bottom
     try:
         cand = driver.find_elements(By.CSS_SELECTOR, "button, a[role='button']")
         cand = [e for e in cand if e.is_displayed()]
@@ -193,21 +312,18 @@ def click_hard(driver, el):
         ok = True
     except Exception:
         pass
-
     if not ok:
         try:
             driver.execute_script("arguments[0].click();", el)
             ok = True
         except Exception:
             pass
-
     if not ok:
         try:
             driver.execute_script(ROBUST_CLICK_JS, el)
             ok = True
         except Exception:
             pass
-
     if not ok:
         try:
             ActionChains(driver).move_to_element(el).pause(0.2).click().perform()
@@ -285,22 +401,17 @@ def collect_inventory_clickhard(driver, dealer_url: str, slow_wait: int, max_rou
         rounds += 1
         btn = find_show_more(driver)
         if not btn:
-            # if no button, try to ensure all lazy batches are in
             for _ in range(3):
                 jiggle(driver)
-            # if still no button and no recent growth, stop
             return sorted(unique)
 
-        before = len(unique)
         clicked = click_hard(driver, btn)
         if not clicked:
-            # try to re-find and click again once
             time.sleep(0.6)
             btn = find_show_more(driver)
             if btn:
                 clicked = click_hard(driver, btn)
 
-        # wait for growth after a click
         end = time.time() + slow_wait
         grew = False
         while time.time() < end:
@@ -315,13 +426,11 @@ def collect_inventory_clickhard(driver, dealer_url: str, slow_wait: int, max_rou
             no_growth_rounds = 0
         else:
             no_growth_rounds += 1
-            # if click seemed ignored, try aggressive pointer sequence + JS again on a fresh ref
             if no_growth_rounds == 1:
                 time.sleep(0.6)
                 btn = find_show_more(driver)
                 if btn:
                     click_hard(driver, btn)
-                    # short extra wait
                     end2 = time.time() + min(10, slow_wait // 2)
                     while time.time() < end2:
                         jiggle(driver)
@@ -331,7 +440,6 @@ def collect_inventory_clickhard(driver, dealer_url: str, slow_wait: int, max_rou
                             no_growth_rounds = 0
                             break
             if no_growth_rounds >= 3:
-                # likely at the end (or site ignored us). Stop cleanly.
                 break
 
     return sorted(unique)
@@ -354,7 +462,7 @@ def crawl(dealers_url: str, out_dir: Path, headed: bool, slow_wait: int, delay_b
             for sel in ["h1", "h2", "title"]:
                 t = dsoup.find(sel)
                 if t and t.get_text(strip=True):
-                    name = sanitize(t.get_text(strip=True)); break
+                    name = sanitize(_clean_title_piece(t.get_text(strip=True))); break
         except Exception:
             name = None
         if not name:
@@ -366,15 +474,29 @@ def crawl(dealers_url: str, out_dir: Path, headed: bool, slow_wait: int, delay_b
         listing_urls = collect_inventory_clickhard(driver, dealer_url, slow_wait=slow_wait, max_rounds=500)
         log(f"[dealer {di}/{len(dealer_urls)}] {name} -> {len(listing_urls)} vehicles")
 
-        # download images per vehicle
+        # per vehicle
         for vi, vurl in enumerate(listing_urls, 1):
-            vfolder = dealer_folder / str(vi); vfolder.mkdir(parents=True, exist_ok=True)
             try:
                 vsoup = soup_from(sess, vurl)
-            except Exception:
+            except Exception as e:
+                log(f"   [warn] vehicle {vi} fetch failed: {e}")
                 continue
+
+            raw_name = extract_vehicle_name(vsoup, vurl)
+            # if still generic (e.g., Car), append best-effort slug
+            if looks_generic(raw_name):
+                slug = slug_from_url(vurl)
+                if slug and not looks_generic(slug):
+                    raw_name = slug
+
+            vname = sanitize(raw_name if raw_name else f"vehicle_{vi}")
+            folder_name = f"{vi}-{vname}"
+            vfolder = dealer_folder / folder_name
+            vfolder.mkdir(parents=True, exist_ok=True)
+
             imgs = extract_images(vurl, vsoup)
-            log(f"   [vehicle {vi}] images: {len(imgs)}")
+            log(f"   [vehicle {vi}] {folder_name} -> images: {len(imgs)}")
+
             for k, img in enumerate(imgs, 1):
                 try:
                     ext = os.path.splitext(urlparse(img).path)[1].lower() or ".jpg"
@@ -393,6 +515,7 @@ def crawl(dealers_url: str, out_dir: Path, headed: bool, slow_wait: int, delay_b
                 except Exception as e:
                     log(f"      [warn] {img} -> {e}")
                 time.sleep(0.05)
+
         time.sleep(delay_between_dealers)
     driver.quit()
 
